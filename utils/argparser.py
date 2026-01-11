@@ -12,7 +12,19 @@ from cogs5e.models.errors import InvalidArgument
 EPHEMERAL_ARG_RE = re.compile(r"(\S+)(\d+)")
 SINGLE_ARG_RE = re.compile(r"([a-zA-Z]\S*(?<!\d))(\d+)?")  # g1: flag name g2: ephem?
 FLAG_ARG_RE = re.compile(r"-+([a-zA-Z]\S*(?<!\d))(\d+)?")  # g1: flag name g2: ephem?
-SINGLE_ARG_EXCEPTIONS = {"-i", "-h", "-v"}
+SINGLE_ARG_EXCEPTIONS = {
+    "-i",
+    "-h",
+    "-v",
+    "-hiddenhit",
+    "-hiddenmiss",
+    "-hiddencrit",
+    "-hiddenpass",
+    "-hiddenfail",
+    "-hiddensucceed",
+    "-hiddencpass",
+    "-hiddencfail",
+}
 
 
 def argsplit(args: str):

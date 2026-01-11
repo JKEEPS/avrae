@@ -5,7 +5,7 @@ from utils.functions import reconcile_adv
 from . import Effect
 from ..errors import AutomationException, NoAttackBonus, TargetException
 from ..results import AttackResult
-from ..utils import stringify_intexpr
+from ..utils import force_leftmost_dice, stringify_intexpr
 
 
 class Attack(Effect):
@@ -46,8 +46,15 @@ class Attack(Effect):
         nocrit = args.last("nocrit", default=False, type_=bool, ephem=True)
         hit = args.last("hit", None, bool, ephem=True) and 1
         miss = (args.last("miss", None, bool, ephem=True) and not hit) and 1
+        silent_hit = args.last("hiddenhit", type_=bool, ephem=True)
+        silent_miss = args.last("hiddenmiss", type_=bool, ephem=True)
+        silent_crit = args.last("hiddencrit", type_=bool, ephem=True)
         b = args.join("b", "+", ephem=True)
         hide = args.last("h", type_=bool)
+
+        if silent_hit or silent_miss or silent_crit:
+            hit = False
+            miss = False
 
         reroll = args.last("reroll", 0, int)
         criton = args.last("criton", 20, int)
@@ -161,15 +168,41 @@ class Attack(Effect):
             else:
                 to_hit_roll = d20.roll(f"{formatted_d20}+{attack_bonus}")
 
-            # hit/miss/crit processing
-            # leftmost roll value - -criton
-            d20_value = d20.utils.leftmost(to_hit_roll.expr).total
-
             # -ac #
             target_ac = autoctx.target.ac
             target_has_ac = target_ac is not None
             if target_has_ac:
                 ac = ac or target_ac
+
+            if silent_hit or silent_miss or silent_crit:
+                orig_d20_value = d20.utils.leftmost(to_hit_roll.expr).total
+                orig_total = to_hit_roll.total
+                if orig_d20_value >= criton or to_hit_roll.crit == d20.CritType.CRIT:
+                    orig_hit = True
+                elif orig_d20_value == 1 or to_hit_roll.crit == d20.CritType.FAIL:
+                    orig_hit = False
+                elif ac and orig_total < ac:
+                    orig_hit = False
+                else:
+                    orig_hit = True
+
+                if silent_miss:
+                    force_leftmost_dice(to_hit_roll.expr, 1)
+                elif silent_crit and orig_hit and not nocrit:
+                    target_nat = max(criton, orig_d20_value)
+                    force_leftmost_dice(to_hit_roll.expr, target_nat)
+                elif silent_hit and not orig_hit:
+                    if ac:
+                        other_total = orig_total - orig_d20_value
+                        needed = ac - other_total
+                        target_nat = max(2, needed)
+                    else:
+                        target_nat = 2
+                    force_leftmost_dice(to_hit_roll.expr, target_nat)
+
+            # hit/miss/crit processing
+            # leftmost roll value - -criton
+            d20_value = d20.utils.leftmost(to_hit_roll.expr).total
 
             # assign hit values
             if d20_value >= criton or to_hit_roll.crit == d20.CritType.CRIT:  # natural crit

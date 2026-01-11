@@ -1,4 +1,5 @@
 import itertools
+import json
 from collections import namedtuple
 from typing import Iterable, List, Optional, TYPE_CHECKING, Union
 
@@ -7,12 +8,13 @@ import disnake
 from cogs5e.initiative import InitiativeEffect
 from cogs5e.initiative.types import BaseCombatant
 from cogs5e.models import embeds
+from cogs5e.models.automation.results import AttackResult, DamageResult, TargetIteration
 from cogs5e.models.errors import InvalidArgument, InvalidSpellLevel, RequiresLicense
 from cogs5e.models.sheet.action import Action, Actions
 from cogs5e.models.sheet.attack import Attack, AttackList
 from gamedata import lookuputils, monster
 from utils import constants
-from utils.enums import CritDamageType
+from utils.enums import ActivationType, CritDamageType
 from utils.functions import a_or_an, confirm, maybe_http_url, natural_join, search_and_select, smart_trim, verbose_stat
 from utils.settings import ServerSettings
 
@@ -64,8 +66,17 @@ async def run_attack(
     }
     args.update_nx(arg_defaults)
 
+    trigger_reactions = combat is not None and attack.activation_type != ActivationType.REACTION
     result = await run_automation(
-        ctx, embed, args, caster, attack.automation, targets, combat, **attack.__run_automation_kwargs__
+        ctx,
+        embed,
+        args,
+        caster,
+        attack.automation,
+        targets,
+        combat,
+        **attack.__run_automation_kwargs__,
+        trigger_reactions=trigger_reactions,
     )
 
     # common embed operations
@@ -111,7 +122,17 @@ async def run_action(
         embed.title = f"{name} uses {action.name}!"
 
     if action.automation:
-        result = await run_automation(ctx, embed, args, caster, action.automation, targets, combat)
+        trigger_reactions = combat is not None and action.activation_type != ActivationType.REACTION
+        result = await run_automation(
+            ctx,
+            embed,
+            args,
+            caster,
+            action.automation,
+            targets,
+            combat,
+            trigger_reactions=trigger_reactions,
+        )
     else:
         # else, show action description and note that it can't be automated
         if action.snippet:
@@ -288,6 +309,9 @@ async def cast_spell(
     # run
     automation_result = None
     if spell.automation and spell.automation.effects:
+        trigger_reactions = combat is not None
+        if spell.time and "reaction" in spell.time.lower():
+            trigger_reactions = False
         automation_result = await run_automation(
             ctx,
             embed,
@@ -297,6 +321,7 @@ async def cast_spell(
             targets,
             combat,
             always_commit_caster=True,
+            trigger_reactions=trigger_reactions,
             spell=spell,
             conc_effect=conc_effect,
             ab_override=ab_override,
@@ -344,6 +369,276 @@ async def cast_spell(
 
 
 CastResult = namedtuple("CastResult", "embed success automation_result")
+REACTION_PENDING_TTL = 60 * 60
+
+
+def _collect_reaction_triggers(automation_result: "AutomationResult") -> dict[str, list[dict[str, int | bool]]]:
+    triggers: dict[str, list[dict[str, int | bool]]] = {}
+
+    def walk(node):
+        if isinstance(node, TargetIteration):
+            target_id = node.target_id
+            if not target_id:
+                return
+
+            saw_attack = False
+            damage_sum = 0
+            target_triggers: list[dict[str, int | bool]] = []
+
+            def walk_target(child):
+                nonlocal saw_attack, damage_sum
+                if isinstance(child, AttackResult):
+                    saw_attack = True
+                    if child.did_hit:
+                        target_triggers.append({
+                            "hit": True,
+                            "damage": child.get_damage(),
+                        })
+                    return
+                if isinstance(child, DamageResult):
+                    if child.damage > 0:
+                        damage_sum += child.damage
+                    return
+                for grandchild in child.get_children():
+                    walk_target(grandchild)
+
+            for child in node.results:
+                walk_target(child)
+
+            if not saw_attack and damage_sum:
+                target_triggers.append({"hit": False, "damage": damage_sum})
+
+            if target_triggers:
+                triggers.setdefault(target_id, []).extend(target_triggers)
+            return
+
+        for child in node.get_children():
+            walk(child)
+
+    walk(automation_result)
+    return triggers
+
+
+def _reaction_names_for_target(target: "BaseCombatant") -> list[str]:
+    names: list[str] = []
+    attacks = getattr(target, "attacks", None)
+    if attacks is not None:
+        names.extend(a.name for a in attacks.reactions)
+
+    character = getattr(target, "character", None)
+    if character is not None:
+        names.extend(a.name for a in character.actions.reactions)
+
+    seen = set()
+    unique = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
+
+
+def _reaction_pending_key(combat: "Combat", combatant_id: str) -> str:
+    return f"cog.reaction.pending.{combat.channel_id}.{combatant_id}"
+
+
+async def _load_pending_reactions(ctx: "AvraeContext", combat: "Combat", combatant_id: str) -> dict | None:
+    key = _reaction_pending_key(combat, combatant_id)
+    raw = await ctx.bot.rdb.get(key)
+    if not raw:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+async def _save_pending_reactions(ctx: "AvraeContext", combat: "Combat", combatant_id: str, data: dict) -> None:
+    key = _reaction_pending_key(combat, combatant_id)
+    await ctx.bot.rdb.setex(key, json.dumps(data), REACTION_PENDING_TTL)
+
+
+async def _delete_prompt_message(ctx: "AvraeContext", prompt: dict | None) -> None:
+    if not prompt:
+        return
+    channel_id = prompt.get("channel_id")
+    message_id = prompt.get("message_id")
+    if channel_id is None or message_id is None:
+        return
+
+    channel = ctx.bot.get_channel(int(channel_id))
+    if channel is None and hasattr(ctx.bot, "fetch_channel"):
+        try:
+            channel = await ctx.bot.fetch_channel(int(channel_id))
+        except disnake.HTTPException:
+            return
+        except Exception:
+            return
+
+    if channel is None:
+        return
+
+    try:
+        msg = disnake.PartialMessage(channel=channel, id=int(message_id))
+        await msg.delete()
+    except disnake.HTTPException:
+        pass
+
+
+async def clear_pending_reactions(
+    ctx: "AvraeContext",
+    combat: "Combat",
+    combatant_id: str,
+    *,
+    delete_prompt: bool = True,
+) -> None:
+    if delete_prompt:
+        pending = await _load_pending_reactions(ctx, combat, combatant_id)
+        if pending:
+            await _delete_prompt_message(ctx, pending.get("prompt"))
+
+    key = _reaction_pending_key(combat, combatant_id)
+    await ctx.bot.rdb.delete(key)
+
+
+def reaction_used_this_round(combat: "Combat", combatant_id: str) -> bool:
+    meta = combat.metadata or {}
+    used = meta.get("reaction_used_rounds", {})
+    return used.get(str(combatant_id)) == combat.round_num
+
+
+def mark_reaction_used(combat: "Combat", combatant_id: str) -> None:
+    if combat.metadata is None:
+        combat.metadata = {}
+    used = combat.metadata.setdefault("reaction_used_rounds", {})
+    used[str(combatant_id)] = combat.round_num
+
+
+def _format_trigger_line(trigger: dict) -> str:
+    parts = []
+    attacker_name = trigger.get("attacker_name")
+    if attacker_name:
+        parts.append(f"from {attacker_name}")
+    if trigger.get("hit"):
+        parts.append("hit")
+    damage = trigger.get("damage")
+    if damage:
+        parts.append(f"{damage} damage")
+    if not parts:
+        return "triggered"
+    return " ".join(parts)
+
+
+def _reaction_buttons(
+    channel_id: int,
+    combatant_id: str,
+    trigger_index: int,
+    reaction_names: list[str],
+    selected: bool,
+) -> list[disnake.ui.Button]:
+    buttons = []
+    action = "use_sel" if selected else "use"
+    for idx, name in enumerate(reaction_names[:25]):
+        label = smart_trim(name, max_len=80, dots="...")
+        custom_id = (
+            f"{constants.B_REACTION_PROMPT}{action}:{channel_id}:{combatant_id}:{trigger_index}:{idx}"
+        )
+        buttons.append(disnake.ui.Button(label=label, style=disnake.ButtonStyle.primary, custom_id=custom_id))
+    return buttons
+
+
+def _number_buttons(channel_id: int, combatant_id: str, count: int) -> list[disnake.ui.Button]:
+    buttons = []
+    for idx in range(min(count, 25)):
+        custom_id = f"{constants.B_REACTION_PROMPT}pick:{channel_id}:{combatant_id}:{idx}"
+        buttons.append(disnake.ui.Button(label=str(idx + 1), style=disnake.ButtonStyle.secondary, custom_id=custom_id))
+    return buttons
+
+
+async def maybe_prompt_reactions(
+    ctx: "AvraeContext",
+    combat: Optional["Combat"],
+    caster: "StatBlock",
+    automation_result: Optional["AutomationResult"],
+) -> None:
+    if combat is None or automation_result is None:
+        return
+
+    triggers = _collect_reaction_triggers(automation_result)
+    if not triggers:
+        return
+
+    attacker_id = getattr(caster, "id", None)
+    attacker_name = caster.get_title_name() if caster is not None else None
+
+    for target_id, new_triggers in triggers.items():
+        target = combat.combatant_by_id(target_id)
+        if target is None:
+            continue
+
+        if reaction_used_this_round(combat, target_id):
+            continue
+
+        reaction_names = _reaction_names_for_target(target)
+        if not reaction_names:
+            continue
+
+        pending = await _load_pending_reactions(ctx, combat, target_id)
+        existing_prompt = pending.get("prompt") if pending else None
+        if not pending or pending.get("round") != combat.round_num:
+            pending = {"round": combat.round_num, "triggers": [], "reactions": reaction_names}
+        else:
+            pending["reactions"] = reaction_names
+
+        for trigger in new_triggers:
+            if not trigger.get("hit") and not trigger.get("damage"):
+                continue
+            pending["triggers"].append({
+                "attacker_id": attacker_id,
+                "attacker_name": attacker_name,
+                "hit": trigger.get("hit", False),
+                "damage": trigger.get("damage", 0),
+            })
+
+        if not pending["triggers"]:
+            continue
+
+        channel_id = combat.channel_id
+        message = None
+        if len(pending["triggers"]) > 1:
+            display_triggers = pending["triggers"][:25]
+            lines = [f"{idx + 1}) {_format_trigger_line(t)}" for idx, t in enumerate(display_triggers)]
+            prompt = (
+                f"Multiple reaction triggers for {target.get_title_name()}.\n"
+                "Choose which to react to:\n"
+                + "\n".join(lines)
+            )
+            if len(pending["triggers"]) > len(display_triggers):
+                prompt += f"\n...and {len(pending['triggers']) - len(display_triggers)} more."
+            buttons = _number_buttons(channel_id, target_id, len(display_triggers))
+            await _delete_prompt_message(ctx, existing_prompt)
+            if getattr(target, "is_private", False):
+                message = await target.message_controller(ctx, prompt, components=buttons)
+            else:
+                message = await ctx.send(prompt, components=buttons)
+        else:
+            trigger = pending["triggers"][0]
+            line = _format_trigger_line(trigger)
+            reaction_list = smart_trim(natural_join(reaction_names, "or"), max_len=400)
+            prompt = f"{target.get_title_name()} can react ({line}). {reaction_list}"
+            buttons = _reaction_buttons(channel_id, target_id, 0, reaction_names, selected=False)
+            await _delete_prompt_message(ctx, existing_prompt)
+            if getattr(target, "is_private", False):
+                message = await target.message_controller(ctx, prompt, components=buttons)
+            else:
+                message = await ctx.send(prompt, components=buttons)
+
+        if message is not None:
+            pending["prompt"] = {"channel_id": message.channel.id, "message_id": message.id}
+        await _save_pending_reactions(ctx, combat, target_id, pending)
 
 
 async def run_automation(
@@ -355,6 +650,7 @@ async def run_automation(
     targets: List[Union[str, "StatBlock"]],
     combat: Optional["Combat"],
     always_commit_caster: bool = False,
+    trigger_reactions: bool = True,
     **kwargs,
 ) -> "AutomationResult":
     """
@@ -390,6 +686,9 @@ async def run_automation(
         and not (combat and caster in combat.get_combatants())
     ):
         await caster.commit(ctx)
+
+    if trigger_reactions and combat is not None and not kwargs.get("from_button"):
+        await maybe_prompt_reactions(ctx, combat, caster, result)
 
     return result
 

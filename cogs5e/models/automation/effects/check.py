@@ -7,7 +7,7 @@ from utils.functions import camel_to_title, maybe_mod, natural_join, reconcile_a
 from . import Effect
 from ..errors import AutomationException, InvalidIntExpression, TargetException
 from ..results import CheckResult
-from ..utils import stringify_intexpr
+from ..utils import force_roll_total, stringify_intexpr
 
 if TYPE_CHECKING:
     from ..runtime import AutomationContext, AutomationTarget
@@ -81,6 +81,14 @@ class Check(Effect):
         ability_list = autoctx.args.get("ability") or self.ability_list
         auto_pass = autoctx.args.last("cpass", type_=bool, ephem=True)
         auto_fail = autoctx.args.last("cfail", type_=bool, ephem=True)
+        silent_pass = (
+            autoctx.args.last("hiddencpass", type_=bool, ephem=True)
+            or autoctx.args.last("hiddenpass", type_=bool, ephem=True)
+            or autoctx.args.last("hiddensucceed", type_=bool, ephem=True)
+        )
+        silent_fail = autoctx.args.last("hiddencfail", type_=bool, ephem=True) or autoctx.args.last(
+            "hiddenfail", type_=bool, ephem=True
+        )
         check_bonus = autoctx.args.get("cb", ephem=True)
         base_adv = reconcile_adv(
             adv=autoctx.args.last("cadv", type_=bool, ephem=True) or self.adv == enums.AdvantageType.ADV,
@@ -160,6 +168,11 @@ class Check(Effect):
 
         # ==== execution ====
         skill_key = None  # In case the target is simple
+        if silent_pass:
+            auto_pass = False
+        if silent_fail:
+            auto_fail = False
+
         if auto_pass:
             is_success = True
             autoctx.queue(f"**{skill_name} Check:** Automatic success!")
@@ -180,6 +193,16 @@ class Check(Effect):
                 min_check=min_check,
             )
             check_roll = d20.roll(check_dice)
+            if silent_fail:
+                if check_dc is not None:
+                    force_roll_total(check_roll, check_dc - 1)
+                elif contest_roll is not None:
+                    force_roll_total(check_roll, contest_roll.total - 1)
+            elif silent_pass:
+                if check_dc is not None:
+                    force_roll_total(check_roll, check_dc)
+                elif contest_roll is not None:
+                    force_roll_total(check_roll, contest_roll.total + 1)
 
             autoctx.metavars["lastCheckRollTotal"] = check_roll.total
             autoctx.metavars["lastCheckNaturalRoll"] = d20.utils.leftmost(check_roll.expr).total
@@ -210,6 +233,9 @@ class Check(Effect):
                     success_str = "; Lose!"
                     contest_out += "; Win!"
                 autoctx.queue(contest_out)
+            elif silent_pass or silent_fail:
+                is_success = silent_pass
+                success_str = "; Success!" if silent_pass else "; Failure!"
 
             out = f"**{skill_name} Check{display_name}**: {check_roll.result}{success_str}"
 

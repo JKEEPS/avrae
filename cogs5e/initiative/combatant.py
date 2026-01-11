@@ -407,7 +407,7 @@ class Combatant(BaseCombatant, StatBlock):
         if member is None:  # member is not in the guild, oh well
             return
         try:
-            await member.send(*args, **kwargs)
+            return await member.send(*args, **kwargs)
         except disnake.Forbidden:  # member is not accepting PMs from us, oh well
             pass
 

@@ -9,6 +9,7 @@ import logging
 import re
 import time
 import traceback
+from contextlib import suppress
 from typing import List
 
 import automation_common.validation
@@ -24,8 +25,10 @@ from aliasing import helpers
 from cogs5e.models import embeds
 from cogs5e.models.character import Character
 from cogs5e.models.embeds import EmbedWithAuthor
-from cogs5e.models.errors import ExternalImportError, NoCharacter
+from cogs5e.models.errors import ExternalImportError, NoCharacter, SelectionException
 from cogs5e.models.sheet.attack import Attack, AttackList
+from cogs5e.initiative import Combat, CombatNotFound, PlayerCombatant
+from cogs5e.initiative.types import BaseCombatant
 from cogs5e.sheets.beyond import BeyondSheetParser, DDB_URL_RE, DDB_PDF_URL_RE
 from cogs5e.sheets.dicecloud import DICECLOUD_URL_RE, DicecloudParser
 from cogs5e.sheets.dicecloudv2 import DICECLOUDV2_URL_RE, DicecloudV2Parser
@@ -34,7 +37,7 @@ from cogs5e.utils import actionutils, checkutils, targetutils
 from cogs5e.utils.help_constants import *
 from ddb.gamelog import CampaignLink
 from ddb.gamelog.errors import NoCampaignLink
-from utils import img
+from utils import constants, img
 from utils.argparser import argparse
 from utils.constants import SKILL_NAMES
 from utils.enums import ActivationType
@@ -52,6 +55,167 @@ class SheetManager(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_button_click(self, interaction: disnake.MessageInteraction):
+        custom_id = interaction.data.custom_id
+        if not custom_id.startswith(constants.B_REACTION_PROMPT):
+            return
+
+        parts = custom_id.split(":")
+        if len(parts) < 5:
+            return
+
+        _, action, channel_id, combatant_id, trigger_index, *rest = parts
+        try:
+            trigger_index = int(trigger_index)
+        except ValueError:
+            return
+
+        reaction_index = None
+        if rest:
+            try:
+                reaction_index = int(rest[0])
+            except ValueError:
+                reaction_index = None
+
+        await interaction.response.defer()
+
+        try:
+            combat = await Combat.from_id(channel_id, interaction)
+        except CombatNotFound:
+            await interaction.followup.send("This channel is no longer in combat.", ephemeral=True)
+            return
+
+        combatant = combat.combatant_by_id(combatant_id)
+        if combatant is None:
+            await interaction.followup.send("This combatant is no longer in combat.", ephemeral=True)
+            return
+
+        author_id = interaction.author.id
+        if not (author_id == combatant.controller_id or author_id == combat.dm_id):
+            await interaction.followup.send(
+                "You do not have permission to control this combatant.",
+                ephemeral=True,
+            )
+            return
+
+        if actionutils.reaction_used_this_round(combat, combatant_id):
+            await actionutils.clear_pending_reactions(interaction, combat, combatant_id)
+            await interaction.followup.send("Reaction already used this round.", ephemeral=True)
+            return
+
+        pending = await actionutils._load_pending_reactions(interaction, combat, combatant_id)
+        if not pending or pending.get("round") != combat.round_num:
+            await actionutils.clear_pending_reactions(interaction, combat, combatant_id)
+            await interaction.followup.send("No pending reaction triggers.", ephemeral=True)
+            return
+
+        triggers = pending.get("triggers") or []
+        if not triggers:
+            await actionutils.clear_pending_reactions(interaction, combat, combatant_id)
+            await interaction.followup.send("No pending reaction triggers.", ephemeral=True)
+            return
+
+        if trigger_index < 0 or trigger_index >= len(triggers):
+            await interaction.followup.send("Invalid reaction trigger selection.", ephemeral=True)
+            return
+
+        reaction_names = pending.get("reactions") or actionutils._reaction_names_for_target(combatant)
+        if not reaction_names:
+            await interaction.followup.send("No reactions available for this combatant.", ephemeral=True)
+            return
+
+        if action == "pick":
+            trigger = triggers[trigger_index]
+            if len(reaction_names) == 1:
+                await self._run_reaction_from_prompt(
+                    interaction, combat, combatant, reaction_names[0], trigger
+                )
+            else:
+                line = actionutils._format_trigger_line(trigger)
+                prompt = f"{combatant.get_title_name()} can react ({line})."
+                buttons = actionutils._reaction_buttons(
+                    combat.channel_id, combatant_id, trigger_index, reaction_names, selected=True
+                )
+                message = await interaction.channel.send(prompt, components=buttons)
+                pending["prompt"] = {"channel_id": message.channel.id, "message_id": message.id}
+                await actionutils._save_pending_reactions(interaction, combat, combatant_id, pending)
+            with suppress(disnake.HTTPException):
+                await interaction.message.edit(components=None)
+            return
+
+        if action == "use" and len(triggers) > 1:
+            await interaction.followup.send(
+                "Multiple reaction triggers are pending. Choose a trigger first.",
+                ephemeral=True,
+            )
+            return
+
+        if reaction_index is None or reaction_index >= len(reaction_names):
+            await interaction.followup.send("Invalid reaction selection.", ephemeral=True)
+            return
+
+        trigger = triggers[trigger_index]
+        await self._run_reaction_from_prompt(
+            interaction, combat, combatant, reaction_names[reaction_index], trigger
+        )
+        with suppress(disnake.HTTPException):
+            await interaction.message.edit(components=None)
+
+    async def _run_reaction_from_prompt(self, interaction, combat, combatant, reaction_name, trigger):
+        attack = next((a for a in combatant.attacks.reactions if a.name == reaction_name), None)
+        action = None
+        if attack is None and isinstance(combatant, PlayerCombatant):
+            action = next((a for a in combatant.character.actions.reactions if a.name == reaction_name), None)
+
+        if attack is None and action is None:
+            await interaction.followup.send("This reaction is no longer available.", ephemeral=True)
+            return
+
+        actionutils.mark_reaction_used(combat, combatant.id)
+        await actionutils.clear_pending_reactions(interaction, combat, combatant.id, delete_prompt=False)
+
+        args_str = ""
+        damage = trigger.get("damage")
+        if damage:
+            args_str = f"-amt {damage}"
+        args = argparse(args_str)
+
+        targets = []
+        attacker_id = trigger.get("attacker_id")
+        attacker_name = trigger.get("attacker_name")
+        if attacker_id:
+            attacker = combat.combatant_by_id(attacker_id)
+            if attacker is not None:
+                targets = [attacker]
+        if not targets and attacker_name:
+            targets = [attacker_name]
+
+        embed = disnake.Embed(color=combatant.get_color())
+        if attack is not None:
+            result = await actionutils.run_attack(interaction, embed, args, combatant, attack, targets, combat)
+            ability_name = attack.name
+        else:
+            class _InteractionActionContext:
+                def __init__(self, inter):
+                    self.bot = inter.bot
+                    self.author = inter.author
+                    self.guild = inter.guild
+                    self.channel = inter.channel
+
+                async def trigger_typing(self):
+                    await self.channel.trigger_typing()
+
+            ctx = _InteractionActionContext(interaction)
+            result = await actionutils.run_action(ctx, embed, args, combatant, action, targets, combat)
+            ability_name = action.name
+
+        await interaction.followup.send(embed=embed)
+        if (gamelog := self.bot.get_cog("GameLog")) and isinstance(combatant, PlayerCombatant) and result is not None:
+            await gamelog.send_automation(interaction, combatant.character, ability_name, result)
+        if result is None and combat is not None:
+            await combat.final(interaction)
 
     @staticmethod
     async def new_arg_stuff(args, ctx, character, base_args=None):
@@ -114,6 +278,76 @@ class SheetManager(commands.Cog):
         await actionutils.send_action_list(
             ctx, caster=caster, attacks=caster.attacks, actions=char.actions, embed=embed, args=args
         )
+
+    @commands.group(
+        aliases=["reaction"],
+        invoke_without_command=True,
+        help=f"""
+        Performs a reaction for the current active character.
+        __**Valid Arguments**__
+        {VALID_AUTOMATION_ARGS}
+        """,
+    )
+    async def react(self, ctx, reaction_name=None, *, args: str = ""):
+        if reaction_name is None:
+            return await self.react_list(ctx)
+        return await self._react(ctx, reaction_name, args)
+
+    @react.command(name="list")
+    async def react_list(self, ctx, *args):
+        """
+        Lists the active character's reactions.
+        __Valid Arguments__
+        -v - Verbose: Displays each action's character sheet description rather than the effect summary.
+        """
+        char: Character = await ctx.get_character()
+        caster = await targetutils.maybe_combat_caster(ctx, char)
+        embed = embeds.EmbedWithCharacter(char, name=False)
+        embed.title = f"{char.name}'s Reactions"
+
+        list_args = ("reaction", *args)
+        await actionutils.send_action_list(
+            ctx, caster=caster, attacks=caster.attacks, actions=char.actions, embed=embed, args=list_args
+        )
+
+    async def _react(self, ctx, reaction_name, args):
+        char: Character = await ctx.get_character()
+        args = await self.new_arg_stuff(args, ctx, char, base_args=[reaction_name])
+        hide = args.last("h", type_=bool)
+        embed = embeds.EmbedWithCharacter(char, name=False, image=not hide)
+
+        caster, targets, combat = await targetutils.maybe_combat(ctx, char, args)
+        attacks = caster.attacks.reactions
+        actions = char.actions.reactions
+        if not attacks and not actions:
+            return await ctx.send("No reactions found for your character.")
+
+        try:
+            attack_or_action = await actionutils.select_action(
+                ctx,
+                reaction_name,
+                attacks=attacks,
+                actions=actions,
+                message="Select your reaction.",
+            )
+        except SelectionException:
+            return await ctx.send("Reaction not found.")
+
+        if combat is not None and isinstance(caster, BaseCombatant):
+            if actionutils.reaction_used_this_round(combat, caster.id):
+                return await ctx.send("Reaction already used this round.")
+            actionutils.mark_reaction_used(combat, caster.id)
+            await actionutils.clear_pending_reactions(ctx, combat, caster.id)
+
+        if isinstance(attack_or_action, Attack):
+            result = await actionutils.run_attack(ctx, embed, args, caster, attack_or_action, targets, combat)
+        else:
+            result = await actionutils.run_action(ctx, embed, args, caster, attack_or_action, targets, combat)
+
+        await ctx.send(embed=embed)
+        await try_delete(ctx.message)
+        if (gamelog := self.bot.get_cog("GameLog")) and result is not None:
+            await gamelog.send_automation(ctx, char, attack_or_action.name, result)
 
     # ---- attack management commands ----
     @action.command(name="add", aliases=["create"])

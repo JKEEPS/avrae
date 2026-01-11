@@ -202,3 +202,70 @@ def parse_save_bonuses(save_type: str, save_bonuses: list[str]) -> list[str]:
             out.append("+".join(current_out))
 
     return out
+
+
+def force_leftmost_dice(expr: d20.Expression, target: int) -> int | None:
+    """
+    Forces the leftmost dice result to a target value, keeping keep/drop output plausible.
+    Returns the clamped target value if applied.
+    """
+    left = d20.utils.leftmost(expr)
+    if not isinstance(left, d20.Dice):
+        return None
+
+    size = None
+    if isinstance(left.size, int):
+        size = left.size
+    elif left.size == "%":
+        size = 100
+
+    target = int(target)
+    if size is not None:
+        target = max(1, min(size, target))
+
+    keep_high = any(op.op == "k" and any(sel.cat == "h" for sel in op.sels) for op in left.operations)
+    keep_low = any(op.op == "k" and any(sel.cat == "l" for sel in op.sels) for op in left.operations)
+
+    if keep_high:
+        dropped_value = max(1, target - 1) if size is None else max(1, min(size, target - 1))
+    elif keep_low:
+        dropped_value = min(size or target + 1, target + 1)
+        if size is None:
+            dropped_value = target + 1
+    else:
+        dropped_value = target
+
+    for die in left.values:
+        value = target if die.kept else dropped_value
+        die.values = [d20.Literal(value)]
+
+    return target
+
+
+def add_expr_bonus(expr: d20.Expression, delta: int) -> None:
+    if not delta:
+        return
+    delta = int(delta)
+    if delta > 0:
+        expr.roll = d20.BinOp(expr.roll, "+", d20.Literal(delta))
+    else:
+        expr.roll = d20.BinOp(expr.roll, "-", d20.Literal(abs(delta)))
+
+
+def force_roll_total(roll: d20.RollResult, target_total: int) -> None:
+    """
+    Forces a roll's total to the target value by adjusting the leftmost dice and adding a literal bonus if needed.
+    """
+    target_total = int(target_total)
+    left = d20.utils.leftmost(roll.expr)
+    if not isinstance(left, d20.Dice):
+        return
+
+    other_total = roll.total - left.total
+    target_natural = target_total - other_total
+    if force_leftmost_dice(roll.expr, target_natural) is None:
+        return
+
+    delta = target_total - roll.total
+    if delta:
+        add_expr_bonus(roll.expr, delta)

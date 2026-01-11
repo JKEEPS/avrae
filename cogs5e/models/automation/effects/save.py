@@ -6,7 +6,7 @@ from utils.functions import maybe_mod, reconcile_adv, verbose_stat
 from . import Effect
 from ..errors import AutomationException, NoSpellDC, TargetException
 from ..results import SaveResult
-from ..utils import stringify_intexpr, parse_save_bonuses
+from ..utils import force_roll_total, parse_save_bonuses, stringify_intexpr
 
 
 class Save(Effect):
@@ -50,6 +50,10 @@ class Save(Effect):
         sb = parse_save_bonuses(save, autoctx.args.get("sb", ephem=True))
         auto_pass = autoctx.args.last("pass", type_=bool, ephem=True)
         auto_fail = autoctx.args.last("fail", type_=bool, ephem=True)
+        silent_pass = autoctx.args.last("hiddenpass", type_=bool, ephem=True) or autoctx.args.last(
+            "hiddensucceed", type_=bool, ephem=True
+        )
+        silent_fail = autoctx.args.last("hiddenfail", type_=bool, ephem=True)
         hide = autoctx.args.last("h", type_=bool)
 
         # ==== dc ====
@@ -123,6 +127,11 @@ class Save(Effect):
 
         if not autoctx.target.is_simple:
             save_blurb = f"{stat.upper()} Save"
+            if silent_pass:
+                auto_pass = False
+            if silent_fail:
+                auto_fail = False
+
             if auto_pass:
                 is_success = True
                 autoctx.queue(f"**{save_blurb}:** Automatic success!")
@@ -132,6 +141,10 @@ class Save(Effect):
             else:
                 save_dice = autoctx.target.get_save_dice(save_skill, adv=adv, sb=sb)
                 save_roll = d20.roll(save_dice)
+                if silent_fail:
+                    force_roll_total(save_roll, dc - 1)
+                elif silent_pass:
+                    force_roll_total(save_roll, dc)
                 is_success = save_roll.total >= dc
 
                 # get natural roll

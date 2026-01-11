@@ -61,9 +61,12 @@ An italicized argument below means the argument supports ephemeral arguments - e
 *eadv* - Elven Accuracy, double advantage on the attack roll.
 *hit* - The attack automatically hits.
 *miss* - The attack automatically misses.
+*hiddenhit* - Forces a hit without announcing it; adjusts the displayed roll.
+*hiddenmiss* - Forces a miss without announcing it; adjusts the displayed roll.
 *-attackroll <value>* - Force the rolled attack to be a fixed number plus modifiers.
 *-attackmin <value>* - Minimum value of the rolled attack before modifiers.
 *crit* - The attack automatically crits.
+*hiddencrit* - Forces a crit without announcing it; adjusts the displayed roll.
 -ac <target ac> - Overrides target AC.
 *-b <bonus>* - Adds a bonus to hit.
 -criton <value> - The number the attack crits on if rolled on or above.
@@ -71,6 +74,8 @@ An italicized argument below means the argument supports ephemeral arguments - e
 **Saves**
 *pass* - Target automatically succeeds the saving throw.
 *fail* - Target automatically fails the saving throw.
+*hiddenpass/hiddensucceed* - Forces success without announcing it; adjusts the displayed roll.
+*hiddenfail* - Forces failure without announcing it; adjusts the displayed roll.
 sadv/sdis - Gives the target advantage/disadvantage on the saving throw.
 -dc <dc> - Overrides the DC of the save.
 -dc <+X/-X> - Modifies the DC by a certain amount.
@@ -114,6 +119,8 @@ nopact - Uses a normal spell slot instead of a Pact Magic slot, if applicable.
 -cdc <+X/-X> - Modifies the DC by a certain amount.
 *cadv/cdis* - Gives the target advantage/disadvantage on the ability check.
 *cpass/cfail* - Target automatically succeeds or fails the ability check if a DC is given.
+*hiddencpass/hiddensucceed* - Forces success without announcing it; adjusts the displayed roll.
+*hiddencfail/hiddenfail* - Forces failure without announcing it; adjusts the displayed roll.
 
 __Contest Against Caster Checks__
 > The following are arguments when the automation causes the target to roll a contested check against you (a Grapple contest, for example).
