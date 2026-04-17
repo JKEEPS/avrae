@@ -15,6 +15,18 @@ services:
     environment:
       DBOT_ARGS: test
       ENVIRONMENT: development
+    labels:
+      com.datadoghq.ad.logs: >-
+        [{
+          "source":"python",
+          "log_processing_rules": [
+            {
+              "type": "include_at_match",
+              "name": "datadog_error_only",
+              "pattern": "\"level\"\\s*:\\s*\"ERROR\""
+            }
+          ]
+        }]
 
   mongo:
     image: mongo
