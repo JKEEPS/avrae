@@ -237,7 +237,8 @@ class AutomationContext:
             out = self.evaluator.eval(expr)
         except Exception as ex:
             raise AutomationEvaluationException(ex, expr)
-        self.evaluator.builtins = original_names
+        finally:
+            self.evaluator.builtins = original_names
         return out
 
     def parse_intexpression(self, intexpression):

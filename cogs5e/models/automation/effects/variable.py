@@ -25,7 +25,6 @@ class SetVariable(Effect):
     def run(self, autoctx):
         super().run(autoctx)
         level_value = self.value
-        # handle upcast
         if self.higher:
             higher = self.higher.get(str(autoctx.get_cast_level()))
             if higher:
@@ -33,7 +32,6 @@ class SetVariable(Effect):
 
         did_error = False
 
-        # parse value
         try:
             value = autoctx.parse_intexpression(level_value)
         except (AutomationEvaluationException, InvalidIntExpression) as e:
@@ -43,7 +41,6 @@ class SetVariable(Effect):
             else:
                 raise StopExecution(f"Error in SetVariable (`{self.name} = {level_value}`):\n{e}")
 
-        # bind
         autoctx.metavars[self.name] = value
         return SetVariableResult(value=value, did_error=did_error)
 
