@@ -34,7 +34,7 @@ docker-compose.override.yml
 docs/_build/
 
 **/.run
-
+.history
 # Adding for Changelog Creation
 **/WorkingChangelog.md
 

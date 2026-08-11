@@ -1597,6 +1597,7 @@ class InitTracker(commands.Cog):
                 return await ctx.send(
                     "You cannot remove a combatant if they are the only remaining combatant in this turn."
                 )
+        await combat.sync_player_hp_to_characters(ctx, combatant)
         combat.remove_combatant(combatant)
         await ctx.send("{} removed from combat.".format(combatant.name))
         await combat.final(ctx)
@@ -1614,14 +1615,22 @@ class InitTracker(commands.Cog):
 
         msg = await ctx.send("OK, ending...")
         combat = await ctx.get_combat()
+        hp_sync_lines = combat.player_hp_sync_lines()
+        hp_sync_note = ""
+        if hp_sync_lines:
+            hp_sync_note = (
+                " If combat is continued later, remember to set character HP/THP to: " + "; ".join(hp_sync_lines)
+            )
 
         with suppress(disnake.HTTPException):
-            await ctx.author.send(f"End of combat report: {combat.round_num} rounds {combat.get_summary(True)}")
+            await ctx.author.send(
+                f"End of combat report: {combat.round_num} rounds {combat.get_summary(True)}{hp_sync_note}"
+            )
             summary = combat.get_summary_msg()
             await summary.edit(content=combat.get_summary() + " ```-----COMBAT ENDED-----```")
             await summary.unpin()
 
-        await combat.end()
+        await combat.end(ctx)
         if combat.nlp_record_session_id is not None:
             await self.nlp.on_combat_end(combat)
         await msg.edit(content="Combat ended.")

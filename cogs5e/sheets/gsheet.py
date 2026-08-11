@@ -29,7 +29,7 @@ from cogs5e.models.sheet.base import BaseStats, Levels, Saves, Skill, Skills
 from cogs5e.models.sheet.resistance import Resistances
 from cogs5e.models.sheet.spellcasting import Spellbook, SpellbookSpell
 from cogs5e.sheets.abc import SHEET_VERSION, SheetLoaderABC
-from cogs5e.sheets.errors import MissingAttribute, AttackSyntaxError, InvalidImageURL, InvalidCoin
+from cogs5e.sheets.errors import MissingAttribute, AttackSyntaxError, InvalidImageURL, InvalidCoin, InvalidCellValue
 from cogs5e.sheets.utils import get_actions_for_names
 from gamedata.compendium import compendium
 from utils import config
@@ -436,6 +436,32 @@ class GoogleSheet(SheetLoaderABC):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._gchar)
 
+    @staticmethod
+    def _is_blank(value):
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    @staticmethod
+    def _sheet_title(sheet):
+        return sheet.worksheet.title
+
+    def _coerce_int(self, value, attribute, cell, sheet, default=None):
+        if self._is_blank(value):
+            if default is not None:
+                return default
+            raise MissingAttribute(attribute, cell, self._sheet_title(sheet))
+        try:
+            return int(value)
+        except (TypeError, ValueError) as e:
+            raise InvalidCellValue(attribute, cell, self._sheet_title(sheet), value, "an integer") from e
+
+    def _read_int(self, sheet, cell, attribute, default=None):
+        value = sheet.value(cell)
+        return self._coerce_int(value, attribute, cell, sheet, default=default)
+
+    def _read_unformatted_int(self, sheet, cell, attribute, default=None):
+        value = sheet.unformatted_value(cell)
+        return self._coerce_int(value, attribute, cell, sheet, default=default)
+
     # calculator functions
     def get_description(self):
         if self.character_data is None:
@@ -474,18 +500,13 @@ class GoogleSheet(SheetLoaderABC):
         character = self.character_data
         if self._stats is not None:
             return self._stats
-        try:
-            prof_bonus = int(character.value("H14"))
-        except (TypeError, ValueError):
-            raise MissingAttribute("Proficiency Bonus", "H14", character.worksheet.title)
+        prof_bonus = self._read_int(character, "H14", "Proficiency Bonus")
         index = 15
         stat_dict = {}
         for stat in ("strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"):
-            try:
-                stat_dict[stat] = int(character.value("C" + str(index)))
-                index += 5
-            except (TypeError, ValueError):
-                raise MissingAttribute(stat, "C" + str(index), character.worksheet.title)
+            cell = "C" + str(index)
+            stat_dict[stat] = self._read_int(character, cell, stat)
+            index += 5
         stats = BaseStats(prof_bonus, **stat_dict)
         self._stats = stats
         return stats
@@ -518,11 +539,8 @@ class GoogleSheet(SheetLoaderABC):
     def get_levels(self):
         if self.character_data is None:
             raise Exception("You must call get_character() first.")
-        try:
-            total_level = int(self.character_data.value("AL6"))
-            self.total_level = total_level
-        except ValueError:
-            raise MissingAttribute("Character level", "AL5", self.character_data.worksheet.title)
+        total_level = self._read_int(self.character_data, "AL6", "Character level")
+        self.total_level = total_level
         level_dict = {}
         if self.additional:
             for rownum in range(69, 79):  # sheet2, C69:C78
@@ -531,7 +549,7 @@ class GoogleSheet(SheetLoaderABC):
                 classname = self.additional.value(namecell)
                 if classname:
                     classname = re.sub(r"[.$]", "_", classname)  # sentry-H7 - invalid class names
-                    classlevel = int(self.additional.value(levelcell))
+                    classlevel = self._read_int(self.additional, levelcell, f"{classname} class level")
                     level_dict[classname] = classlevel
                 else:  # classes should be top-aligned
                     break
@@ -569,26 +587,24 @@ class GoogleSheet(SheetLoaderABC):
 
         if self.version == (2, 0):
             is_joat = bool(character.value("AR45"))
-            all_check_bonus = int(character.value("AQ26") or 0)
+            all_check_bonus = self._read_int(character, "AQ26", "All ability check bonus", default=0)
         elif self.version == (2, 1):
             is_joat = bool(character.value("AQ59"))
             is_ra = bool(character.value("AQ67"))  # parsing for remarkable athlethe from champion 7
-            all_check_bonus = int(character.value("AR58"))
+            all_check_bonus = self._read_int(character, "AR58", "All ability check bonus", default=0)
         joat_bonus = int(is_joat and self.get_stats().prof_bonus // 2)
         # upside-down floor division to do ceiling division for half-prof bonus (rounded up) of remarkable athlethe
         ra_bonus = int(is_ra and -(self.get_stats().prof_bonus // -2))
 
         # calculate str, dex, con, etc checks
         for cell, skill, advcell in BASE_ABILITY_CHECKS:
-            try:
-                # add bonuses manually since the cell does not include them
-                # seperate basic abilities into (dex, str, con) so remarkable athlete half-prof can be added
-                if skill == "dexterity" or skill == "constitution" or skill == "strength":
-                    value = int(character.value(cell)) + all_check_bonus + max(joat_bonus, ra_bonus)
-                else:
-                    value = int(character.value(cell)) + all_check_bonus + joat_bonus
-            except (TypeError, ValueError):
-                raise MissingAttribute(skill, cell, character.worksheet.title)
+            base_value = self._read_int(character, cell, skill)
+            # add bonuses manually since the cell does not include them
+            # seperate basic abilities into (dex, str, con) so remarkable athlete half-prof can be added
+            if skill == "dexterity" or skill == "constitution" or skill == "strength":
+                value = base_value + all_check_bonus + max(joat_bonus, ra_bonus)
+            else:
+                value = base_value + all_check_bonus + joat_bonus
             prof = 0
             if is_ra:
                 if skill == "dexterity" or skill == "constitution" or skill == "strength":
@@ -605,10 +621,7 @@ class GoogleSheet(SheetLoaderABC):
                 cell = f"I{cell}"
             else:
                 profcell = None
-            try:
-                value = int(character.value(cell))
-            except (TypeError, ValueError):
-                raise MissingAttribute(skill, cell, character.worksheet.title)
+            value = self._read_int(character, cell, skill)
             adv = None
             if self.version >= (2, 0) and advcell:
                 advtype = character.unformatted_value(advcell)
@@ -653,16 +666,10 @@ class GoogleSheet(SheetLoaderABC):
         return Resistances.from_dict(out)
 
     def get_ac(self):
-        try:
-            return int(self.character_data.value("R12"))
-        except (TypeError, ValueError):
-            raise MissingAttribute("AC", "R12", self.character_data.worksheet.title)
+        return self._read_int(self.character_data, "R12", "AC")
 
     def get_hp(self):
-        try:
-            return int(self.character_data.unformatted_value("U16"))
-        except (TypeError, ValueError):
-            raise MissingAttribute("Max HP", "U16", self.character_data.worksheet.title)
+        return self._read_unformatted_int(self.character_data, "U16", "Max HP")
 
     def get_race(self):
         return self.character_data.value("T7").strip()
@@ -689,15 +696,15 @@ class GoogleSheet(SheetLoaderABC):
             raise Exception("You must call get_character() first.")
         # max slots
         slots = {
-            "1": int(self.character_data.value("AK101") or 0),
-            "2": int(self.character_data.value("E107") or 0),
-            "3": int(self.character_data.value("AK113") or 0),
-            "4": int(self.character_data.value("E119") or 0),
-            "5": int(self.character_data.value("AK124") or 0),
-            "6": int(self.character_data.value("E129") or 0),
-            "7": int(self.character_data.value("AK134") or 0),
-            "8": int(self.character_data.value("E138") or 0),
-            "9": int(self.character_data.value("AK142") or 0),
+            "1": self._read_int(self.character_data, "AK101", "Level 1 spell slots", default=0),
+            "2": self._read_int(self.character_data, "E107", "Level 2 spell slots", default=0),
+            "3": self._read_int(self.character_data, "AK113", "Level 3 spell slots", default=0),
+            "4": self._read_int(self.character_data, "E119", "Level 4 spell slots", default=0),
+            "5": self._read_int(self.character_data, "AK124", "Level 5 spell slots", default=0),
+            "6": self._read_int(self.character_data, "E129", "Level 6 spell slots", default=0),
+            "7": self._read_int(self.character_data, "AK134", "Level 7 spell slots", default=0),
+            "8": self._read_int(self.character_data, "E138", "Level 8 spell slots", default=0),
+            "9": self._read_int(self.character_data, "AK142", "Level 9 spell slots", default=0),
         }
 
         potential_spells = self._get_potential_spells()

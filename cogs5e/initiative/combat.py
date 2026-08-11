@@ -515,15 +515,64 @@ class Combat:
 
         return messages
 
-    async def end(self):
+    async def end(self, ctx=None):
         """Ends combat in a channel."""
+        ctx = ctx or self.ctx
+        if ctx is None:
+            raise RequiresContext("Combat end requires context.")
+
+        await self.sync_player_hp_to_characters(ctx)
         for c in self._combatants:
             c.on_remove()
-        await self.ctx.bot.mdb.combats.delete_one({"channel": self._channel})
+        await ctx.bot.mdb.combats.delete_one({"channel": self._channel})
         try:
             del Combat._cache[self._channel]
         except KeyError:
             pass
+
+    async def sync_player_hp_to_characters(self, ctx, combatant: Combatant | None = None) -> list[str]:
+        """
+        Syncs initiative-local HP/THP snapshots for one combatant (or all player combatants) back to their characters.
+
+        Returns reminder lines that can be shown to users if they need to continue combat elsewhere.
+        """
+        if ctx is None:
+            return []
+
+        if combatant is None:
+            targets = self.get_combatants()
+        elif isinstance(combatant, CombatantGroup):
+            targets = combatant.get_combatants()
+        else:
+            targets = [combatant]
+
+        reminder_lines = []
+        to_commit = {}
+        for target in targets:
+            if not isinstance(target, PlayerCombatant):
+                continue
+            target.sync_hp_to_character()
+            reminder_lines.append(f"{target.name}: {target.hp_str(private=True)}")
+            to_commit[(target.character.owner, target.character.upstream)] = target.character
+
+        for character in to_commit.values():
+            await character.commit(ctx)
+
+        return reminder_lines
+
+    def player_hp_sync_lines(self, combatant: Combatant | None = None) -> list[str]:
+        """Builds reminder lines for initiative-local player HP/THP values."""
+        if combatant is None:
+            targets = self.get_combatants()
+        elif isinstance(combatant, CombatantGroup):
+            targets = combatant.get_combatants()
+        else:
+            targets = [combatant]
+        return [
+            f"{target.name}: {target.hp_str(private=True)}"
+            for target in targets
+            if isinstance(target, PlayerCombatant)
+        ]
 
     # stringification
     def get_turn_str(self, status=True, **kwargs) -> Optional[str]:
@@ -608,7 +657,8 @@ class Combat:
         """Commits the combat to db."""
         for pc in self.get_combatants():
             if isinstance(pc, PlayerCombatant):
-                await pc.character.commit(ctx)
+                # HP/THP are initiative-local and synced on removal/end; other character resources still persist.
+                await pc.character.commit(ctx, persist_hp=False)
         await ctx.bot.mdb.combats.update_one(
             {"channel": self._channel},
             {"$set": self.to_dict(), "$currentDate": {"lastchanged": True}},

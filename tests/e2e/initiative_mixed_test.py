@@ -73,28 +73,40 @@ class TestCharacterMixedInitiative:
 
     async def test_attack_II_self(self, avrae, dhttp):
         char = await active_character(avrae)
+        hp_before = char.hp
+        temp_hp_before = char.temp_hp
         await attack_I(avrae, dhttp, name=char.name)
         await dhttp.drain()
 
-        # make sure damage was saved to character
+        # make sure in-combat HP is isolated from the character while combat is active
         combat = await active_combat(avrae)
         char = await active_character(avrae)
         me = combat.get_combatant(char.name, strict=True)
-        assert me.hp == char.hp
+        assert me.hp < hp_before
+        assert char.hp == hp_before
+        assert char.temp_hp == temp_hp_before
 
     async def test_cast_II_self(self, avrae, dhttp):
         char = await active_character(avrae)
+        hp_before = char.hp
+        temp_hp_before = char.temp_hp
         await cast_I(avrae, dhttp, names=[char.name])
         await dhttp.drain()
 
-        # make sure damage was saved to character
+        # make sure in-combat HP is isolated from the character while combat is active
         combat = await active_combat(avrae)
         char = await active_character(avrae)
         me = combat.get_combatant(char.name, strict=True)
-        assert me.hp == char.hp
+        assert char.hp == hp_before
+        assert char.temp_hp == temp_hp_before
+        type(self).expected_end_hp = me.hp
+        type(self).expected_end_temp_hp = me.temp_hp
 
     async def test_init_II_to_XX(self, avrae, dhttp):  # end init, II -> XX
         await end_init(avrae, dhttp)
+        char = await active_character(avrae)
+        assert char.hp == self.expected_end_hp
+        assert char.temp_hp == self.expected_end_temp_hp
 
 
 async def attack_X(dhttp, delete_first=False):

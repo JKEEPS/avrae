@@ -369,9 +369,12 @@ class Character(StatBlock):
         return out
 
     # ---------- DATABASE ----------
-    async def commit(self, ctx, do_live_integrations=True):
+    async def commit(self, ctx, do_live_integrations=True, persist_hp=True):
         """Writes a character object to the database, under the contextual author."""
         data = self.to_dict()
+        if not persist_hp:
+            data.pop("hp", None)
+            data.pop("temp_hp", None)
         data.pop("active")  # #1472 - may regress when doing atomic commits, be careful
         data.pop("active_guilds")
         data.pop("active_channels")

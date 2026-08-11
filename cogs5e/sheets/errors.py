@@ -15,6 +15,19 @@ class MissingAttribute(ExternalImportError):
         super().__init__(f"Missing character attribute: {attribute} in cell {cell} on sheet '{sheet}'")
 
 
+class InvalidCellValue(ExternalImportError):
+    def __init__(self, attribute, cell, sheet, value, expected):
+        self.attribute = attribute
+        self.cell = cell
+        self.sheet = sheet
+        self.value = value
+        self.expected = expected
+        super().__init__(
+            f"Invalid value for {attribute} in cell {cell} on sheet '{sheet}'. "
+            f"Expected {expected}, got {value!r}."
+        )
+
+
 class AttackSyntaxError(ExternalImportError):
     def __init__(self, attack_name, cell, sheet, error):
         self.attack_name = attack_name
@@ -39,4 +52,4 @@ class InvalidCoin(ExternalImportError):
         self.sheet = sheet
         self.coin_type = coin_type
         self.error = error
-        super().__init__(f"Invalid value for {coin_type} in cell {cell} on sheet '{sheet}:\n> {error}")
+        super().__init__(f"Invalid value for {coin_type} in cell {cell} on sheet '{sheet}':\n> {error}")

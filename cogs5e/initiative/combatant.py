@@ -679,6 +679,8 @@ class PlayerCombatant(Combatant):
         resistances: Resistances = None,
         ac: int = None,
         max_hp: int = None,
+        hp: int = None,
+        temp_hp: int = 0,
         # character specific
         character_id: str = None,
         character_owner: str = None,
@@ -702,6 +704,8 @@ class PlayerCombatant(Combatant):
             resistances=resistances,
             ac=ac,
             max_hp=max_hp,
+            hp=hp,
+            temp_hp=temp_hp,
         )
         self.character_id = character_id
         self.character_owner = character_owner
@@ -721,6 +725,9 @@ class PlayerCombatant(Combatant):
             init,
             # statblock copies
             resistances=character.resistances.copy(),
+            max_hp=character.max_hp,
+            hp=character.hp,
+            temp_hp=character.temp_hp,
             # character specific
             character_id=character.upstream,
             character_owner=character.owner,
@@ -731,26 +738,40 @@ class PlayerCombatant(Combatant):
     # ==== serialization ====
     @classmethod
     async def from_dict(cls, raw, ctx, combat):
+        has_hp_snapshot = "hp" in raw
+        has_temp_hp_snapshot = "temp_hp" in raw
         inst = super().from_dict(raw, ctx, combat)
         inst.character_id = raw["character_id"]
         inst.character_owner = raw["character_owner"]
         inst._character = await cogs5e.models.character.Character.from_bot_and_ids(
             ctx.bot, inst.character_owner, inst.character_id
         )
+        # backwards-compat for combats created before player HP snapshots were persisted
+        if not has_hp_snapshot:
+            inst._hp = inst._character.hp
+        if not has_temp_hp_snapshot:
+            inst._temp_hp = inst._character.temp_hp
         return inst
 
     @classmethod
     def from_dict_sync(cls, raw, ctx, combat):
+        has_hp_snapshot = "hp" in raw
+        has_temp_hp_snapshot = "temp_hp" in raw
         inst = super().from_dict(raw, ctx, combat)
         inst.character_id = raw["character_id"]
         inst.character_owner = raw["character_owner"]
         inst._character = cogs5e.models.character.Character.from_bot_and_ids_sync(
             ctx.bot, inst.character_owner, inst.character_id
         )
+        # backwards-compat for combats created before player HP snapshots were persisted
+        if not has_hp_snapshot:
+            inst._hp = inst._character.hp
+        if not has_temp_hp_snapshot:
+            inst._temp_hp = inst._character.temp_hp
         return inst
 
     def to_dict(self):
-        ignored_attributes = ("stats", "levels", "skills", "saves", "spellbook", "hp", "temp_hp")
+        ignored_attributes = ("stats", "levels", "skills", "saves", "spellbook")
         raw = super().to_dict()
         for attr in ignored_attributes:
             del raw[attr]
@@ -836,25 +857,19 @@ class PlayerCombatant(Combatant):
 
     @property
     def hp(self) -> int:
-        return self.character.hp
+        return self._hp
 
     @hp.setter
     def hp(self, new_hp):
-        self.character.hp = new_hp
-
-    def set_hp(self, new_hp):
-        return self.character.set_hp(new_hp)
-
-    def reset_hp(self):
-        return self.character.reset_hp()
+        self._hp = max(0, new_hp)
 
     @property
     def temp_hp(self) -> int:
-        return self.character.temp_hp
+        return self._temp_hp
 
     @temp_hp.setter
     def temp_hp(self, new_hp):
-        self.character.temp_hp = new_hp
+        self._temp_hp = max(0, new_hp)
 
     @property
     def attacks(self) -> AttackList:
@@ -865,3 +880,15 @@ class PlayerCombatant(Combatant):
 
     def get_color(self):
         return self.character.get_color()
+
+    def sync_hp_to_character(self):
+        """
+        Persists this combat instance's HP state back to the underlying character.
+
+        This is intentionally called when leaving combat (e.g. combat end/remove), not on each combat update, so HP
+        remains isolated between simultaneous combats.
+        """
+        if self._hp is not None:
+            self.character.hp = self._hp
+        self.character.temp_hp = self._temp_hp or 0
+        # TODO: Isolate and reconcile other mutable resources (spell slots, consumables, coinpurse) per combat.
