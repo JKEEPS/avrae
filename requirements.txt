@@ -1,17 +1,17 @@
 # avrae org deps
 git+https://github.com/avrae/draconic@master
-git+https://github.com/avrae/automation-common@v4.2.0
+git+https://github.com/avrae/automation-common@v4.4.0
 d20==1.1.2
 
 # top-level deps
-aiohttp==3.11
+aiohttp==3.13.4
 aiobotocore==2.12.4
 redis==5.0.4
 cachetools==5.3.3
 markdownify==0.14.1
 psutil==5.9.8
 pydantic==1.10.19
-pyjwt==2.4.0
+pyjwt==2.12.0
 python-meteor==0.1.6
 pyyaml==6.0.1
 
